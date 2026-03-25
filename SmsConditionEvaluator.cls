@@ -14,7 +14,7 @@ public with sharing class SmsConditionEvaluator {
                                   Map<Id,SObject> oldMap,
                                   SObject newRec,
                                   String tzKey) {
-        return allPass(rules, newRec == null ? rec : newRec, oldMap, tzKey);
+        return allPass(rules, newRec == null ? rec : newRec, parentCache, oldMap, tzKey);
     }
 
     public static Boolean allPass(List<derive_sms_rules__c> rules,
@@ -27,12 +27,20 @@ public with sharing class SmsConditionEvaluator {
                                   SObject newRec,
                                   Map<Id,SObject> oldMap,
                                   String tzKey) {
+        return allPass(rules, newRec, null, oldMap, tzKey);
+    }
+
+    public static Boolean allPass(List<derive_sms_rules__c> rules,
+                                  SObject newRec,
+                                  Map<Id,SObject> parentCache,
+                                  Map<Id,SObject> oldMap,
+                                  String tzKey) {
         if (newRec == null || rules == null) return false;
         Boolean anyEvaluated = false;
         for (derive_sms_rules__c r : rules) {
             if (r == null || r.Active__c != true) continue;
             anyEvaluated = true;
-            Boolean passed = evalOne(r, newRec, oldMap, tzKey);
+            Boolean passed = evalOne(r, newRec, parentCache, oldMap, tzKey);
             System.debug('SCE.allPass: rule=' + r.Id + ' type=' + r.condition_type__c + ' passed=' + passed);
             if (!passed) return false;
         }
@@ -41,6 +49,7 @@ public with sharing class SmsConditionEvaluator {
 
     private static Boolean evalOne(derive_sms_rules__c r,
                                    SObject n,
+                                   Map<Id,SObject> parentCache,
                                    Map<Id,SObject> oldMap,
                                    String tzKey) {
         String kind = safeTrim(r.condition_type__c);
@@ -57,8 +66,7 @@ public with sharing class SmsConditionEvaluator {
 
             String expOld = safeTrim(r.transition_old_value__c);
             String expNew = safeTrim(r.transition_new_value__c);
-            System.debug('MCC Tranisition : Old value = '+expOld+' New value = '+expNew);
-            
+
             return matchTransition(oldVal, newVal, expOld, expNew, tzKey);
         }
         else if ('Filter'.equalsIgnoreCase(kind)) {
@@ -71,7 +79,7 @@ public with sharing class SmsConditionEvaluator {
                 if (String.isBlank(lookupFieldApi)) return false;
                 Id parentId = (Id) safeGetField(n, lookupFieldApi);
                 if (parentId == null) return false;
-                actual = fetchLookupValue(n, parentId, lookupFieldApi, fieldApi);
+                actual = fetchLookupValue(n, parentCache, parentId, lookupFieldApi, fieldApi);
             } else {
                 actual = safeGetField(n, fieldApi);
             }
@@ -101,15 +109,31 @@ public with sharing class SmsConditionEvaluator {
         // Legacy blank behavior: treat as unconstrained.
         if (expected == null) return true;
 
-        // Transition token semantics:
+        // Transition operands are evaluated as IN-style semantics:
+        // any token match is sufficient. Tokens can be separated by ',' or ';'
+        // and may include special values:
         // NULL => null/empty
         // ANY  => anything except null/empty
         // ALL  => anything including null/empty
-        if (expected.equalsIgnoreCase('NULL')) return isNullOrEmptyTransition(actual);
-        if (expected.equalsIgnoreCase('ANY'))  return !isNullOrEmptyTransition(actual);
-        if (expected.equalsIgnoreCase('ALL'))  return true;
+        List<String> tokens = splitMulti(expected);
+        if (tokens == null || tokens.isEmpty()) tokens = new List<String>{ expected };
 
-        return matchOne(actual, expected, tzKey);
+        for (String tokenRaw : tokens) {
+            String token = safeTrim(tokenRaw);
+            if (String.isBlank(token)) continue;
+
+            if (token.equalsIgnoreCase('ALL')) return true;
+            if (token.equalsIgnoreCase('NULL')) {
+                if (isNullOrEmptyTransition(actual)) return true;
+                continue;
+            }
+            if (token.equalsIgnoreCase('ANY')) {
+                if (!isNullOrEmptyTransition(actual)) return true;
+                continue;
+            }
+            if (matchOne(actual, token, tzKey)) return true;
+        }
+        return false;
     }
 
     private static Boolean isNullOrEmptyTransition(Object v) {
@@ -397,11 +421,23 @@ public with sharing class SmsConditionEvaluator {
     }
 
     private static Object fetchLookupValue(SObject n,
+                                           Map<Id,SObject> parentCache,
                                            Id parentId,
                                            String lookupFieldApi,
                                            String fieldApi) {
         try {
             if (parentId == null || String.isBlank(fieldApi)) return null;
+
+            if (parentCache != null && parentCache.containsKey(parentId)) {
+                SObject cached = parentCache.get(parentId);
+                if (cached != null) {
+                    try {
+                        return cached.get(fieldApi);
+                    } catch (Exception ignoreCached) {
+                        // field not loaded on cached record; fallback to query
+                    }
+                }
+            }
 
             // Resolve parent object from the actual Id prefix to support polymorphic/multi-reference lookups.
             String parentObj = parentId.getSObjectType().getDescribe().getName();
@@ -417,6 +453,7 @@ public with sharing class SmsConditionEvaluator {
 
             String soql = 'SELECT ' + fieldApi + ' FROM ' + parentObj + ' WHERE Id = :parentId LIMIT 1';
             SObject parent = Database.query(soql);
+            if (parentCache != null && parent != null) parentCache.put(parentId, parent);
             return parent == null ? null : parent.get(fieldApi);
         } catch (Exception ex) {
             System.debug('SCE.fetchLookupValue: lookup=' + lookupFieldApi

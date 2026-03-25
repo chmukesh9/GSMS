@@ -18,6 +18,13 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
         public String body;
     }
 
+    private class DeliveryMessage {
+        public SObject rec;
+        public String e164;
+        public Id meuId;
+        public String body;
+    }
+
     public SmsScheduleBatch(Id masterId, String fireKey, Datetime nextUtc) {
         this.masterId = masterId;
         this.fireKey  = fireKey;
@@ -85,7 +92,7 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
 
                 recordsMatched++;
 
-                String e164 = firstNonBlankMobile(rec, b.master, parentCache);
+                String e164 = firstNonBlankPhone(rec, b.master, parentCache);
                 System.debug('SB.exec: recId=' + rec.get('Id') + ' e164=' + e164);
                 if (String.isBlank(e164)) continue;
 
@@ -128,7 +135,7 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
             }
         }
 
-        List<SmsHistoryService.HistoryLogItem> historyItems = new List<SmsHistoryService.HistoryLogItem>();
+        List<DeliveryMessage> deliveries = new List<DeliveryMessage>();
         for (PendingMessage msg : pending) {
             try {
                 String normalized = SmsUtil.formatPhone(msg.e164);
@@ -136,29 +143,61 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
                 Id meuId = meuByPhone.get(normalized);
                 if (meuId == null) continue;
 
-                System.debug('SB.exec: sending to MEU=' + meuId);
+                DeliveryMessage d = new DeliveryMessage();
+                d.rec = msg.rec;
+                d.e164 = msg.e164;
+                d.meuId = meuId;
+                d.body = msg.body;
+                deliveries.add(d);
+            } catch (Exception ex) {
+                Id recId = msg == null || msg.rec == null ? null : (Id) msg.rec.get('Id');
+                logBatchError(b, recId, ex, new Map<String,Object>{
+                    'phase' => 'prepare-send',
+                    'messagesSent' => messagesSent
+                });
+            }
+        }
+
+        Map<String, List<DeliveryMessage>> deliveriesByBody = new Map<String, List<DeliveryMessage>>();
+        for (DeliveryMessage d : deliveries) {
+            if (d == null || d.meuId == null || String.isBlank(d.body)) continue;
+            if (!deliveriesByBody.containsKey(d.body)) deliveriesByBody.put(d.body, new List<DeliveryMessage>());
+            deliveriesByBody.get(d.body).add(d);
+        }
+
+        List<SmsHistoryService.HistoryLogItem> historyItems = new List<SmsHistoryService.HistoryLogItem>();
+        for (String body : deliveriesByBody.keySet()) {
+            List<DeliveryMessage> group1 = deliveriesByBody.get(body);
+            if (group1 == null || group1.isEmpty()) continue;
+            List<Id> recipientIds = new List<Id>();
+            for (DeliveryMessage d : group1) recipientIds.add(d.meuId);
+
+            try {
                 SmsEventEngine.beginSuppress();
                 try {
-                    SmsFlowSender.sendOne(meuId, msg.body);
+                    SmsFlowSender.sendMany(recipientIds, body);
                 } finally {
                     SmsEventEngine.endSuppress();
                 }
 
-                SmsHistoryService.HistoryLogItem item = new SmsHistoryService.HistoryLogItem();
-                item.rec = msg.rec;
-                item.runMode = 'Scheduled';
-                item.fireKey = fireKey;
-                item.phoneE164 = msg.e164;
-                item.masterCode = b.master == null ? null : b.master.Name;
-                item.templateCode = b.template == null ? null : b.template.Name;
-                item.messageBody = msg.body;
-                historyItems.add(item);
-                messagesSent++;
+                for (DeliveryMessage d : group1) {
+                    SmsHistoryService.HistoryLogItem item = new SmsHistoryService.HistoryLogItem();
+                    item.rec = d.rec;
+                    item.runMode = 'Scheduled';
+                    item.fireKey = fireKey;
+                    item.phoneE164 = d.e164;
+                    item.masterCode = b.master == null ? null : b.master.Name;
+                    item.templateCode = b.template == null ? null : b.template.Name;
+                    item.messageBody = d.body;
+                    historyItems.add(item);
+                    messagesSent++;
+                }
             } catch (Exception ex) {
-                Id recId = msg == null || msg.rec == null ? null : (Id) msg.rec.get('Id');
+                Id recId = (group1[0] == null || group1[0].rec == null) ? null : (Id) group1[0].rec.get('Id');
                 logBatchError(b, recId, ex, new Map<String,Object>{
-                    'phase' => 'send',
-                    'messagesSent' => messagesSent
+                    'phase' => 'send-bulk-group',
+                    'messagesSent' => messagesSent,
+                    'groupSize' => group1.size()
                 });
             }
         }
@@ -218,7 +257,8 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
         } catch (Exception ignore) {
             tzKey = null;
         }
-		        Datetime nowUtc = System.now();
+
+        Datetime nowUtc = System.now();
         String tzId = SmsScheduleService.timezoneIdForKey(tzKey);
         String lastLocalStr = nowUtc.format('d/M/yyyy, h:mm a', tzId).toLowerCase();
         String nextLocalStr = (nextUtc == null ? null : nextUtc.format('d/M/yyyy, h:mm a', tzId).toLowerCase());
@@ -437,7 +477,7 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
             } else if ('Lookup'.equalsIgnoreCase(source) || 'LookUp'.equalsIgnoreCase(source)) {
                 String lookupFieldApi = resolveFieldApi(fmap, normalizeField(r.filter_object_name__c));
                 String parentFieldApi = normalizeField(r.filter_field__c);
-				                if (String.isBlank(lookupFieldApi) || String.isBlank(parentFieldApi)) continue;
+                if (String.isBlank(lookupFieldApi) || String.isBlank(parentFieldApi)) continue;
                 Schema.SObjectField sf = fmap.get(lookupFieldApi);
                 if (sf == null) continue;
                 String relName = sf.getDescribe().getRelationshipName();
@@ -466,6 +506,12 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
                 if (String.isBlank(val) || val.equalsIgnoreCase('NULL') || val.equalsIgnoreCase('EMPTY')) {
                     terms.add(soqlPath + ' = NULL');
                 } else {
+                    if (fieldType == Schema.DisplayType.DateTime && isRelativeDateLiteral(val)) {
+                        String rangeCond = buildDateTimeRelativeRangeCondition(soqlPath, val, b, r, false);
+                        if (String.isBlank(rangeCond)) continue;
+                        terms.add(rangeCond);
+                        continue;
+                    }
                     String soqlVal = toSoqlLiteralWithRuleContext(val, fieldType, isBooleanField, b, r);
                     if (soqlVal == null) continue;
                     terms.add(soqlPath + ' = ' + soqlVal);
@@ -474,6 +520,12 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
                 if (String.isBlank(val) || val.equalsIgnoreCase('NULL') || val.equalsIgnoreCase('EMPTY')) {
                     terms.add(soqlPath + ' != NULL');
                 } else {
+                    if (fieldType == Schema.DisplayType.DateTime && isRelativeDateLiteral(val)) {
+                        String rangeCond = buildDateTimeRelativeRangeCondition(soqlPath, val, b, r, true);
+                        if (String.isBlank(rangeCond)) continue;
+                        terms.add(rangeCond);
+                        continue;
+                    }
                     String soqlVal = toSoqlLiteralWithRuleContext(val, fieldType, isBooleanField, b, r);
                     if (soqlVal == null) continue;
                     terms.add(soqlPath + ' != ' + soqlVal);
@@ -657,7 +709,7 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
 
     private static Integer parseInlineDayOffset(String tail) {
         if (String.isBlank(tail)) return 0;
-		        String s = tail.trim();
+        String s = tail.trim();
         if (!(s.startsWith('+') || s.startsWith('-'))) return 0;
         try {
             return Integer.valueOf(s);
@@ -668,6 +720,73 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
 
     private static String quoteSoql(String v) {
         return '\'' + String.escapeSingleQuotes(v == null ? '' : v) + '\'';
+    }
+
+    private static String buildDateTimeRelativeRangeCondition(
+        String soqlPath,
+        String rawLiteral,
+        MasterBundle b,
+        derive_sms_rules__c r,
+        Boolean negate
+    ) {
+        if (String.isBlank(soqlPath) || String.isBlank(rawLiteral)) return null;
+        String tzKey = (b == null || b.master == null) ? null : b.master.Schedule_TZ__c;
+        Date localDate = resolveRelativeLocalDate(rawLiteral, tzKey, r);
+        if (localDate == null) return null;
+
+        Datetime localStart = Datetime.newInstanceGmt(localDate, Time.newInstance(0,0,0,0));
+        Datetime localEnd = localStart.addDays(1);
+        Datetime startUtc = SmsScheduleService.toUtcTime(tzKey, localStart);
+        Datetime endUtc = SmsScheduleService.toUtcTime(tzKey, localEnd);
+        if (startUtc == null) startUtc = localStart;
+        if (endUtc == null) endUtc = localEnd;
+
+        String rangeExpr = soqlPath + ' >= ' + startUtc.formatGmt('yyyy-MM-dd\'T\'HH:mm:ss\'Z\'')
+            + ' AND ' + soqlPath + ' < ' + endUtc.formatGmt('yyyy-MM-dd\'T\'HH:mm:ss\'Z\'');
+        return negate == true ? 'NOT (' + rangeExpr + ')' : '(' + rangeExpr + ')';
+    }
+
+    private static Date resolveRelativeLocalDate(String rawLiteral, String tzKey, derive_sms_rules__c r) {
+        if (String.isBlank(rawLiteral)) return null;
+        String lit = rawLiteral.trim().toUpperCase().replace(' ', '');
+
+        Integer baseDayAdjust = 0;
+        Integer inlineDays = 0;
+        if (lit.startsWith('TODAY')) {
+            inlineDays = parseInlineDayOffset(lit.substring('TODAY'.length()));
+        } else if (lit.startsWith('TOMORROW')) {
+            baseDayAdjust = 1;
+            inlineDays = parseInlineDayOffset(lit.substring('TOMORROW'.length()));
+        } else if (lit.startsWith('YESTERDAY')) {
+            baseDayAdjust = -1;
+            inlineDays = parseInlineDayOffset(lit.substring('YESTERDAY'.length()));
+        } else if (lit.startsWith('NOW')) {
+            inlineDays = parseInlineDayOffset(lit.substring('NOW'.length()));
+        } else {
+            return null;
+        }
+
+        Integer offsDayCount = (r == null || r.offset_days__c == null)
+            ? 0
+            : Integer.valueOf(Math.round(r.offset_days__c));
+        Integer offsSeconds = (r == null || r.filter_offset_hours__c == null)
+            ? 0
+            : Integer.valueOf(Math.round(r.filter_offset_hours__c * 3600));
+
+        Datetime nowUtc = Datetime.now();
+        Datetime localNow = SmsScheduleService.toLocalTime(tzKey, nowUtc);
+        if (localNow == null) localNow = nowUtc;
+
+        Datetime localAnchor;
+        if (lit.startsWith('NOW')) {
+            localAnchor = localNow;
+        } else {
+            Date baseLocalDate = localNow.date().addDays(baseDayAdjust + inlineDays);
+            localAnchor = Datetime.newInstanceGmt(baseLocalDate, Time.newInstance(0,0,0,0));
+        }
+
+        Datetime shiftedLocal = localAnchor.addDays(offsDayCount).addSeconds(offsSeconds);
+        return shiftedLocal.date();
     }
 
     private static void prefetchLookupParents(Map<Id, SObject> recById, MasterBundle b, Map<Id,SObject> parentCache) {
@@ -776,6 +895,15 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
         String e3 = SmsUtil.formatPhone(p3); if (e3 != null) return e3;
         return null;
     }
+        private static String firstNonBlankPhone(SObject rec, derive_sms_condition_master__c m, Map<Id,SObject> cache) {
+        String p1 = readPhone(rec, m.phone_1_source__c, m.phone_1_object__c, m.phone_1_field__c, cache);
+        String e1 = SmsUtil.formatPhone(p1); if (e1 != null) return e1;
+        String p2 = readPhone(rec, m.phone_2_source__c, m.phone_2_object__c, m.phone_2_field__c, cache);
+        String e2 = SmsUtil.formatPhone(p2); if (e2 != null) return e2;
+        String p3 = readPhone(rec, m.phone_3_source__c, m.phone_3_object__c, m.phone_3_field__c, cache);
+        String e3 = SmsUtil.formatPhone(p3); if (e3 != null) return e3;
+        return null;
+    }
 
     private static String readPhone(SObject rec, String src, String lookupFieldApi, String phoneFieldApi, Map<Id,SObject> cache){
         if (String.isBlank(phoneFieldApi)) return null;
@@ -840,5 +968,4 @@ public with sharing class SmsScheduleBatch implements Database.Batchable<SObject
             // Intentionally swallow to avoid masking scheduler flow.
         }
     }
-
 }

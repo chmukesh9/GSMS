@@ -85,7 +85,7 @@ public with sharing class SmsScheduleDispatcher implements Schedulable {
 
         for (SmsScheduleBatch b : batchesToRun) {
             try {
-                Database.executeBatch(b, 200);
+                Database.executeBatch(b, 20);
             } catch (Exception ex) {
                 SmsErrorLogger.log(
                     SmsErrorLogger.Severity.Error,
